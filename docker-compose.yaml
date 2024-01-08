@@ -1,0 +1,27 @@
+version: "3.8"
+
+services:
+  server:
+    build:
+      context: ../_faraway-test
+      dockerfile: _server.Dockerfile
+    environment:
+      CACHE_TTL: "10"
+      SERVER_PORT: "8080"
+      SERVER_MAX_ATTEMPTS: "1000000"
+      SERVER_HASH_BITS: "3"
+      SERVER_HASH_TTL: "300"
+      SERVER_TIMEOUT: "30"
+    ports:
+      - "8080:8080"
+
+  client:
+    build:
+      context: ../_faraway-test
+      dockerfile: _client.Dockerfile
+    environment:
+      CLIENT_HOST: "server"
+      CLIENT_PORT: "8080"
+      CLIENT_MAX_ATTEMPTS: "1000000"
+    depends_on:
+      - server

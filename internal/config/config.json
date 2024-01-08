@@ -1,0 +1,18 @@
+{
+  "env": "dev",
+  "cache": {
+    "ttl": 300
+  },
+  "client": {
+    "port": 8080,
+    "max_attempts": 1000000,
+    "timeout": 30
+  },
+  "server": {
+    "port": 8080,
+    "max_attempts": 1000000,
+    "hash_bits": 3,
+    "hash_ttl": 6000,
+    "timeout": 30
+  }
+}
