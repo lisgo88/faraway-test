@@ -5,7 +5,9 @@ go 1.21
 require (
 	github.com/golang/mock v1.6.0
 	github.com/rs/zerolog v1.31.0
+	github.com/satori/go.uuid v1.2.0
 	github.com/stretchr/testify v1.8.4
+	google.golang.org/protobuf v1.32.0
 )
 
 require (

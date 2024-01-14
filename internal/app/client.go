@@ -1,9 +1,9 @@
 package app
 
 import (
-	"bufio"
 	"context"
 	"fmt"
+	"google.golang.org/protobuf/proto"
 	"io"
 	"net"
 	"time"
@@ -39,78 +39,79 @@ func (c *Client) Run(ctx context.Context) error {
 	}
 
 	c.logger.Info().Any("config", conn.LocalAddr()).Msg("TCP client starting...")
-	defer conn.Close()
+	defer func() {
+		_ = conn.Close()
+	}()
 
 	// client will send new request every 1 second endlessly
 	for {
-		msg, err := c.handleConnection(ctx, conn, conn)
+		res, reqID, err := c.handleConnection(ctx, conn, conn)
 		if err != nil {
+			c.logger.Error().Err(err).Any("requestID", reqID).Msg("err handle connection")
+			_ = conn.Close()
+
 			return err
 		}
 
-		c.logger.Info().Msgf("got result quote: %s", msg)
+		if res != "" {
+			c.logger.Info().Any("requestID", reqID).Msgf("got result quote: %s", res)
+		}
+
 		time.Sleep(1 * time.Second)
 	}
 }
 
-func (c *Client) handleConnection(_ context.Context, readerConn io.Reader, writerConn io.Writer) (string, error) {
-	reader := bufio.NewReader(readerConn)
+func (c *Client) handleConnection(ctx context.Context, r io.Reader, w io.Writer) (string, string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-	// 1 - request challenge
-	if err := c.writeMsg(message.Message{Command: message.CommandRequestChallenge}, writerConn); err != nil {
-		return "", fmt.Errorf("err send request: %w", err)
-	}
-
-	// read response
-	rawMsg, err := c.readMsg(reader)
+	buffer := make([]byte, 1024)
+	length, err := r.Read(buffer)
 	if err != nil {
-		return "", fmt.Errorf("err read msg: %w", err)
+		c.logger.Error().Err(err).Msg("read from conn")
+		return "", "", err
 	}
 
-	// parse raw message
-	msg, err := message.ParseMessage(rawMsg)
-	if err != nil {
-		c.logger.Error().Err(err).Any("raw msg", rawMsg).Msg("err parse msg")
-		return "", fmt.Errorf("err parse msg: %w", err)
+	serverMsg := &message.Message{}
+	if err := proto.Unmarshal(buffer[:length], serverMsg); err != nil {
+		c.logger.Error().Err(err).Msg("unmarshal msg")
+		return "", "", err
 	}
 
-	hc, err := hashcash.ParseHeader(msg.Payload)
-	if err != nil {
-		return "", fmt.Errorf("err parse hashcash: %w", err)
+	if serverMsg.Challenge != "" {
+		hc, err := hashcash.ParseHeader(serverMsg.Challenge)
+		if err != nil {
+			c.logger.Error().Err(err).Msg("parse hashcash")
+			return "", serverMsg.RequestID, err
+		}
+
+		if err := hc.Compute(c.config.MaxAttempts); err != nil {
+			c.logger.Debug().Any("hashcash", hc).Msg("compute hashcash")
+			return "", serverMsg.RequestID, err
+		}
+
+		msg := &message.Message{
+			RequestID: serverMsg.RequestID,
+			ClientID:  serverMsg.ClientID,
+			Challenge: string(hc.Header()),
+		}
+
+		clientRes, err := proto.Marshal(msg)
+		if err != nil {
+			c.logger.Error().Err(err).Msg("marshal msg")
+			return "", serverMsg.RequestID, err
+		}
+
+		if err := c.writeMsg(clientRes, w); err != nil {
+			return "", serverMsg.RequestID, err
+		}
 	}
 
-	// 2. got challenge, compute hashcash
-	if err := hc.Compute(c.config.MaxAttempts); err != nil {
-		c.logger.Debug().Any("hashcash", hc).Msg("err compute hashcash")
-		return "", fmt.Errorf("err compute hashcash: %w", err)
-	}
-
-	// 3 - request resource with challenge
-	if err := c.writeMsg(message.Message{Command: message.CommandRequestResource, Payload: string(hc.Header())}, writerConn); err != nil {
-		return "", fmt.Errorf("err send request: %w", err)
-	}
-
-	// 4 - response with resource
-	rawMsg, err = c.readMsg(reader)
-	if err != nil {
-		return "", fmt.Errorf("err read msg: %w", err)
-	}
-
-	// parse raw message
-	msg, err = message.ParseMessage(rawMsg)
-	if err != nil {
-		return "", fmt.Errorf("err parse msg: %w", err)
-	}
-
-	return msg.Payload, nil
+	return serverMsg.Payload, serverMsg.RequestID, nil
 }
 
-func (c *Client) readMsg(reader *bufio.Reader) (string, error) {
-	return reader.ReadString(message.DelimiterMessage)
-}
-
-func (c *Client) writeMsg(msg message.Message, w io.Writer) error {
-	if _, err := w.Write(msg.Bytes()); err != nil {
+func (c *Client) writeMsg(msg []byte, w io.Writer) error {
+	if _, err := w.Write(msg); err != nil {
 		c.logger.Error().Err(err).Msg("io write error")
 		return err
 	}
