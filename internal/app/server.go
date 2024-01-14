@@ -1,15 +1,18 @@
 package app
 
 import (
-	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/rs/zerolog"
+	uuid "github.com/satori/go.uuid"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/lisgo88/faraway-test/internal/config"
 	"github.com/lisgo88/faraway-test/internal/pkg/hashcash"
@@ -18,16 +21,14 @@ import (
 )
 
 type Server struct {
-	cacheRepo  repository.Cache
 	quotesRepo repository.Quotes
 
 	config config.ServerConfig
 	logger zerolog.Logger
 }
 
-func NewServer(cr repository.Cache, qr repository.Quotes, cfg config.ServerConfig, log zerolog.Logger) *Server {
+func NewServer(qr repository.Quotes, cfg config.ServerConfig, log zerolog.Logger) *Server {
 	return &Server{
-		cacheRepo:  cr,
 		quotesRepo: qr,
 		config:     cfg,
 		logger:     log,
@@ -36,6 +37,9 @@ func NewServer(cr repository.Cache, qr repository.Quotes, cfg config.ServerConfi
 
 // Run - start server
 func (s *Server) Run(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	address := fmt.Sprintf("%s:%d", s.config.Host, s.config.Port)
 
 	listener, err := net.Listen("tcp", address)
@@ -43,14 +47,36 @@ func (s *Server) Run(ctx context.Context) error {
 		return err
 	}
 
-	defer listener.Close()
+	defer func() {
+		_ = listener.Close()
+	}()
+
 	s.logger.Info().Any("config", listener.Addr()).Msg("TCP server starting...")
+
+	// graceful shutdown
+	go func() {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+		<-sigChan
+
+		s.logger.Info().Msg("Received termination signal. Closing server...")
+
+		cancel()
+		_ = listener.Close()
+	}()
 
 	for {
 		// listen for an incoming connection.
 		conn, err := listener.Accept()
 		if err != nil {
-			return fmt.Errorf("error accept connection: %w", err)
+			select {
+			case <-ctx.Done():
+				s.logger.Info().Msg("Server is shutting down.")
+				return nil
+			default:
+				s.logger.Error().Err(err).Msg("accept connection error")
+				continue
+			}
 		}
 
 		// set timeout for connection
@@ -62,132 +88,100 @@ func (s *Server) Run(ctx context.Context) error {
 }
 
 func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
-	s.logger.Info().Str("client", conn.RemoteAddr().String()).Msg("new client")
-	defer conn.Close()
+	defer func() {
+		_ = conn.Close()
+	}()
 
-	reader := bufio.NewReader(conn)
+	ctx = context.WithValue(ctx, "clientID", conn.RemoteAddr().String())
+	s.logger.Info().Any("clientID", ctx.Value("clientID")).Msg("new client")
 
+	buffer := make([]byte, 1024)
 	for {
-		rawMsg, err := reader.ReadString(message.DelimiterMessage)
-		if err != nil {
-			s.logger.Error().Err(err).Any("rawMsg", rawMsg).Msg("read connection")
-			s.writeMsg(message.Message{}, err, conn)
-
+		select {
+		case <-ctx.Done():
+			s.logger.Info().Any("requestID", ctx.Value("requestID")).Msg("connection handling canceled")
 			return
-		}
+		default:
+			ctx = context.WithValue(ctx, "requestID", uuid.NewV4())
 
-		msg, err := s.processRequest(ctx, rawMsg, conn.RemoteAddr().String())
-		if err != nil {
-			s.logger.Error().Err(err).Msg("request processing")
-			s.writeMsg(message.Message{}, err, conn)
+			// create hashcash
+			hc, err := hashcash.New(ctx, s.config.HashBits)
+			if err != nil {
+				s.logger.Error().Err(err).Any("requestID", ctx.Value("requestID")).Msg("create hashcash")
+				return
+			}
 
-			return
-		}
+			// send hashcash to client
+			msg := &message.Message{
+				RequestID: ctx.Value("requestID").(uuid.UUID).String(),
+				ClientID:  ctx.Value("clientID").(string),
+				Challenge: string(hc.Header()),
+			}
 
-		if msg != nil {
-			s.writeMsg(*msg, nil, conn)
+			data, err := proto.Marshal(msg)
+			if err != nil {
+				s.logger.Error().Err(err).Any("requestID", ctx.Value("requestID")).Msg("marshal msg")
+				s.writeMsg(nil, err, conn)
+
+				return
+			}
+
+			_, err = conn.Write(data)
+			if err != nil {
+				s.logger.Error().Err(err).Any("requestID", ctx.Value("requestID")).Msg("write msg")
+				s.writeMsg(nil, err, conn)
+
+				return
+			}
+
+			length, _ := conn.Read(buffer)
+			clientMsg := &message.Message{}
+			if err := proto.Unmarshal(buffer[:length], clientMsg); err != nil {
+				s.logger.Error().Err(err).Any("requestID", ctx.Value("requestID")).Msg("unmarshal msg")
+				s.writeMsg(nil, err, conn)
+
+				return
+			}
+
+			clientHc, err := hashcash.ParseHeader(clientMsg.Challenge)
+			if err != nil {
+				s.logger.Error().Err(err).Any("requestID", ctx.Value("requestID")).Msg("parse hashcash")
+				s.writeMsg(nil, err, conn)
+
+				return
+			}
+
+			if ok, err := clientHc.IsValid(ctx, s.config.HashTTL); ok && err == nil {
+				quot, _ := s.quotesRepo.GetQuote()
+				msg.Payload = quot
+
+				data, err := proto.Marshal(msg)
+				if err != nil {
+					s.logger.Error().Err(err).Any("requestID", ctx.Value("requestID")).Msg("marshal msg")
+					s.writeMsg(nil, err, conn)
+
+					return
+				}
+
+				s.writeMsg(data, nil, conn)
+			} else {
+				s.logger.Error().Err(err).Any("requestID", ctx.Value("requestID")).Msg("valid hashcash")
+				s.writeMsg(nil, err, conn)
+
+				return
+			}
 		}
 	}
 }
 
-// ProcessRequest - process request from client
-func (s *Server) processRequest(_ context.Context, rawMsg string, clientInfo string) (*message.Message, error) {
-	msg, err := message.ParseMessage(rawMsg)
-	if err != nil {
-		return nil, err
-	}
-
-	// switch by command from message
-	switch msg.Command {
-	case message.CommandError:
-		return nil, errors.New("client requests to close connection")
-	case message.CommandRequestChallenge:
-		s.logger.Debug().Str("client", clientInfo).Msg("client requests challenge")
-
-		hc, err := hashcash.New(s.config.HashBits, clientInfo)
-		if err != nil {
-			s.logger.Error().Err(err).Msg("err create hashcash")
-			return nil, err
-		}
-
-		err = s.cacheRepo.SetWithTTL(hc.Key(), "", s.config.HashTTL)
-		if err != nil {
-			s.logger.Error().Err(err).Msg("err add rand to cache")
-			return nil, err
-		}
-
-		msg := message.Message{
-			Command: message.CommandResponseChallenge,
-			Payload: string(hc.Header()),
-		}
-
-		return &msg, nil
-	case message.CommandRequestResource:
-		s.logger.Debug().Str("client", clientInfo).Any("payload", msg.Payload).Msg("client requests resource")
-
-		// parse client's solution
-		hc, err := hashcash.ParseHeader(msg.Payload)
-		if err != nil {
-			s.logger.Error().Err(err).Msg("parse payload")
-			return nil, err
-		}
-
-		if !hc.EqualResource(clientInfo) {
-			err := errors.New("resource is not equal")
-			s.logger.Error().Err(err).Msg("validate error")
-			return nil, err
-		}
-
-		if _, ok := s.cacheRepo.Get(hc.Key()); !ok {
-			err := errors.New("hashcash not found")
-			s.logger.Error().Err(err).Any("key", hc.Key()).Msg("validate error")
-			return nil, err
-		}
-
-		if !hc.IsActual(s.config.HashTTL) {
-			err := errors.New("date is not equal")
-			s.logger.Error().Err(err).Msg("validate error")
-			return nil, err
-		}
-
-		isHashCorrect, err := hc.Header().IsHashCorrect(hc.Bits())
-		if err != nil {
-			s.logger.Error().Err(err).Msg("validate error")
-			return nil, err
-		}
-		if !isHashCorrect {
-			err := errors.New("hash is not correct")
-			s.logger.Error().Err(err).Msg("validate error")
-			return nil, err
-		}
-
-		resource, err := s.quotesRepo.GetQuote()
-		if err != nil {
-			s.logger.Error().Err(err).Msg("get quote error")
-			return nil, err
-		}
-
-		msg := message.Message{
-			Command: message.CommandResponseResource,
-			Payload: resource,
-		}
-
-		// delete hashcash from cache
-		_ = s.cacheRepo.Delete(hc.Key())
-		return &msg, nil
-	default:
-		return nil, fmt.Errorf("unknown header")
-	}
-}
-
-func (s *Server) writeMsg(msg message.Message, err error, w io.Writer) {
+func (s *Server) writeMsg(msg []byte, err error, w io.Writer) {
 	if err != nil { // if error, send error message
 		if _, errWrite := w.Write([]byte(err.Error())); errWrite != nil {
 			s.logger.Error().Err(errWrite).Msg("io write error")
 		}
 	}
 
-	if _, err := w.Write(msg.Bytes()); err != nil {
+	if _, err := w.Write(msg); err != nil {
 		s.logger.Error().Err(err).Msg("io write error")
 	}
 }

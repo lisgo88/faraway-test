@@ -3,7 +3,7 @@ version: "3.8"
 services:
   server:
     build:
-      context: ../_faraway-test
+      context: .
       dockerfile: _server.Dockerfile
     environment:
       CACHE_TTL: "10"
@@ -17,7 +17,7 @@ services:
 
   client:
     build:
-      context: ../_faraway-test
+      context: .
       dockerfile: _client.Dockerfile
     environment:
       CLIENT_HOST: "server"

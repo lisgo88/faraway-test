@@ -9,7 +9,6 @@ import (
 
 	"github.com/lisgo88/faraway-test/internal/app"
 	"github.com/lisgo88/faraway-test/internal/config"
-	"github.com/lisgo88/faraway-test/internal/pkg/repository/cache"
 	"github.com/lisgo88/faraway-test/internal/pkg/repository/quotes"
 )
 
@@ -34,14 +33,11 @@ func main() {
 	logger.Info().Any("msg", cfg).Msg("server config")
 	logger = logger.Level(cfg.LogLevel) // set log level
 
-	// init cache client
-	cacheRepo := cache.New(ctx, cfg.Cache, logger)
-
 	// quotes repository
 	quotesRepo := quotes.New(ctx, logger)
 
 	// init service
-	server := app.NewServer(cacheRepo, quotesRepo, cfg.Server, logger)
+	server := app.NewServer(quotesRepo, cfg.Server, logger)
 
 	// run tcp server
 	err = server.Run(ctx)

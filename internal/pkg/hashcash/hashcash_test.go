@@ -1,19 +1,23 @@
 package hashcash
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
 
 func TestParseHashcash(t *testing.T) {
+	ctx, _ := context.WithCancel(context.Background())
+	ctx = context.WithValue(ctx, "clientID", "1234")
+
 	t.Run("zero bits error", func(t *testing.T) {
-		_, err := New(0, ":payload:")
+		_, err := New(ctx, 0)
 		require.EqualError(t, err, "zero bits must be more than zero")
 	})
 
 	t.Run("create success", func(t *testing.T) {
-		original, err := New(20, ":payload:")
+		original, err := New(ctx, 20)
 		require.NoError(t, err)
 
 		parsed, err := ParseHeader(string(original.Header()))
@@ -21,7 +25,7 @@ func TestParseHashcash(t *testing.T) {
 		require.Equal(t, original, parsed)
 
 		parsed.counter++
-		require.Equal(t, original.Key(), parsed.Key())
+		require.Equal(t, original.bits, parsed.bits)
 	})
 
 	t.Run("max attempts error", func(t *testing.T) {

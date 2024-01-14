@@ -1,0 +1,10 @@
+syntax = "proto3";
+
+option go_package = "internal/pkg/message";
+
+message Message {
+  string requestID = 1;
+  string clientID = 2;
+  string challenge = 3;
+  string payload = 4;
+}
